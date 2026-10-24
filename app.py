@@ -290,7 +290,8 @@ async def decide(policy, pkgs):
     if todo:
         try:
             got = await llm_batch(policy, todo)
-        except Exception:
+        except Exception as ex:
+            print("LLM ERROR:", repr(ex), getattr(getattr(ex, "response", None), "text", "")[:500], flush=True)
             got = {}
         for p in todo:
             d = validate(p, got.get(str(p["packageId"])))
