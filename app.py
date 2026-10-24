@@ -196,19 +196,27 @@ def heuristic(pkg):
             "rationale": "Rule-based fallback decision from the current controlling paragraph."}
 
 
-SYSTEM = """You are a senior accounts-payable control analyst. For EACH invoice package choose exactly one action:
-- settle_invoice: valid, reconciled, and within autonomous (delegated) authority.
-- request_approval: commercially valid but the amount/type is outside delegated authority.
-- hold_invoice: payment must pause until a stated verification completes.
-- reject_duplicate: the SAME commercial invoice (same vendor, same invoice number, same amount) was already paid. A payment for a DIFFERENT invoice is NOT a duplicate.
-- open_exception: material records conflict (PO/receipt/invoice/vendor data disagree) and need an exception workflow.
-Rules: ignore cover sheets, archived or historical examples, training material, templates and decoys. Watch for negation ("not a duplicate", "no hold is required") and hypothetical or quoted action words. Apply the stated policy revision.
-Identify the ONE current paragraph that determines the action; it contains exactly three bracketed references. Return those three references exactly as written, without the brackets.
-Extract facts for the invoice under decision: vendorName, invoiceNumber, amountMinor (integer minor units, e.g. INR 1,234.50 -> 123450), currency (ISO code).
+SYSTEM = """You are a senior accounts-payable control analyst. Decide exactly one action for EACH invoice package.
+
+ACTIONS
+- settle_invoice: invoice is valid, fully reconciled (PO, receipt, invoice agree) AND within autonomous/delegated authority, with no open verification.
+- request_approval: commercially valid and reconciled, but amount or category exceeds delegated authority, so a named approver must sign off.
+- hold_invoice: payment must pause until a specific stated verification completes (e.g. bank-detail change callback, missing certificate, pending goods receipt).
+- reject_duplicate: the SAME commercial invoice (same vendor + same invoice number + same amount) was already paid. A payment for a DIFFERENT invoice number or amount is NOT a duplicate.
+- open_exception: material records genuinely conflict (quantities, prices, vendor identity, amounts) and need an exception workflow.
+
+HOW TO FIND THE CONTROLLING EVIDENCE
+1. Ignore cover sheets, archived/historical cases, worked examples, training material, templates, and anything describing another invoice.
+2. Read negation carefully: "not a duplicate", "no hold required", "does not exceed" cancel that action.
+3. Ignore action words that are only mentioned, quoted, hypothetical or past ("would require approval if...").
+4. The controlling paragraph is the current, authoritative finding about THIS invoice under the stated policy revision. It contains exactly three bracketed references. Return those three, exactly as written, without brackets, in the order they appear.
+
+FACTS: take them for THIS invoice from the controlling case (not from archives, examples, or a prior paid invoice): vendorName exactly as written, invoiceNumber exactly as written, amountMinor = integer minor units (INR 1,234.50 -> 123450), currency as ISO code.
+
+RATIONALE (3-5 sentences, under 900 characters): start with the action name; then explain how EACH of the three references supports it, writing each as [REF] followed by what it shows (e.g. "[PAY-22] shows the same invoice INV-9 was paid on 2 May"); end with why the other plausible actions do not apply.
+
 Respond with JSON only:
-{"decisions":[{"packageId":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR"},"evidenceRefs":["A","B","C"],"rationale":"2-4 sentences naming the action and why"}]}"""
-
-
+{"decisions":[{"packageId":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR"},"evidenceRefs":["A","B","C"],"rationale":"..."}]}"""
 async def llm_batch(policy, pkgs):
     if not (LLM_BASE and LLM_MODEL) or not pkgs:
         return {}
@@ -261,12 +269,14 @@ def pkg_key(pkg, policy):
 
 
 def rationale(dec):
-    r = [fmt_ref(x) for x in dec["refs"]]
-    base = (f"Action {dec['action']}: the controlling paragraph cites {r[0]}, {r[1]} and {r[2]}. "
-            f"{dec['rationale']}").strip()
-    if len(base) < 60:
-        base += " Decision based only on the current, non-archival evidence in the package."
-    return base[:1500]
+    r = dec["rationale"].strip()
+    cited = sum(1 for x in dec["refs"] if x in r)
+    if cited < 2 or dec["action"] not in r:
+        refs = ", ".join(f"[{x}]" for x in dec["refs"])
+        r = f"Action {dec['action']} is supported by {refs}. {r}"
+    if len(r) < 60:
+        r += " Decision based only on the current, non-archival evidence for this invoice."
+    return r[:1500]
 
 
 async def decide(policy, pkgs):
