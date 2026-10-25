@@ -220,30 +220,48 @@ Respond with JSON only:
 
 
 async def llm_batch(policy, pkgs):
-    if not (LLM_BASE and LLM_MODEL) or not pkgs:
+    """Try each model in LLM_MODELS (comma list, falls back to LLM_MODEL) until one answers, within ~40s."""
+    models = [m.strip() for m in os.environ.get("LLM_MODELS", LLM_MODEL).split(",") if m.strip()]
+    if not (LLM_BASE and models) or not pkgs:
         return {}
     user = json.dumps({"policyRevision": policy, "packages": pkgs}, ensure_ascii=False)
-    body = {"model": LLM_MODEL, "temperature": 0, "messages": [
-        {"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
-        "response_format": {"type": "json_object"},
-            "max_tokens": int(os.environ.get("MAX_TOKENS", "8000"))}
-    if os.environ.get("LLM_REASONING"):
-        body["reasoning_effort"] = os.environ["LLM_REASONING"]
     hdr = {"Authorization": f"Bearer {LLM_KEY}"} if LLM_KEY else {}
-    async with httpx.AsyncClient(timeout=40) as c:
-        for attempt in range(2):
-            r = await c.post(f"{LLM_BASE}/chat/completions", json=body, headers=hdr)
-            if r.status_code == 400 and "response_format" in body:
-                body.pop("response_format")
-                continue
-            if r.status_code in (500, 502, 503) and attempt == 0:
-                await asyncio.sleep(2)
-                continue
-            break
-        r.raise_for_status()
-        txt = r.json()["choices"][0]["message"]["content"]
-    txt = txt[txt.find("{"): txt.rfind("}") + 1]
-    return {str(d.get("packageId")): d for d in json.loads(txt).get("decisions", [])}
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + float(os.environ.get("LLM_BUDGET", "40"))
+    last = None
+    async with httpx.AsyncClient() as c:
+        for model in models * 2:  # two passes over the list
+            left = deadline - loop.time()
+            if left < 4:
+                break
+            body = {"model": model, "temperature": 0, "messages": [
+                {"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
+                "response_format": {"type": "json_object"},
+                "max_tokens": int(os.environ.get("MAX_TOKENS", "8000"))}
+            if os.environ.get("LLM_REASONING"):
+                body["reasoning_effort"] = os.environ["LLM_REASONING"]
+            try:
+                r = await c.post(f"{LLM_BASE}/chat/completions", json=body, headers=hdr, timeout=left - 1)
+                if r.status_code == 400 and "response_format" in r.text:
+                    body.pop("response_format")
+                    r = await c.post(f"{LLM_BASE}/chat/completions", json=body, headers=hdr,
+                                     timeout=max(2, deadline - loop.time() - 1))
+                if r.status_code in (429, 500, 502, 503, 504):
+                    print(f"LLM BUSY {model}: {r.status_code}", flush=True)
+                    last = r.status_code
+                    await asyncio.sleep(0.5)
+                    continue
+                r.raise_for_status()
+                txt = r.json()["choices"][0]["message"]["content"] or ""
+                txt = txt[txt.find("{"): txt.rfind("}") + 1]
+                out = {str(d.get("packageId")): d for d in json.loads(txt).get("decisions", [])}
+                if out:
+                    return out
+                print(f"LLM EMPTY {model}", flush=True)
+            except Exception as ex:
+                print(f"LLM ERROR {model}:", repr(ex), getattr(getattr(ex, "response", None), "text", "")[:300], flush=True)
+                last = ex
+    raise RuntimeError(f"all models failed: {last}")
 
 
 def validate(pkg, d):
