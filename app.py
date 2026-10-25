@@ -213,23 +213,33 @@ HOW TO FIND THE CONTROLLING EVIDENCE
 
 FACTS: take them for THIS invoice from the controlling case (not from archives, examples, or a prior paid invoice): vendorName exactly as written, invoiceNumber exactly as written, amountMinor = integer minor units (INR 1,234.50 -> 123450), currency as ISO code.
 
-RATIONALE (3-5 sentences, under 900 characters): start with the action name; then explain how EACH of the three references supports it, writing each as [REF] followed by what it shows (e.g. "[PAY-22] shows the same invoice INV-9 was paid on 2 May"); end with why the other plausible actions do not apply.
+RATIONALE (2-3 sentences, under 450 characters): start with the action name; then explain how EACH of the three references supports it, writing each as [REF] followed by what it shows (e.g. "[PAY-22] shows the same invoice INV-9 was paid on 2 May"); end with why the other plausible actions do not apply.
 
 Respond with JSON only:
 {"decisions":[{"packageId":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR"},"evidenceRefs":["A","B","C"],"rationale":"..."}]}"""
+
+
 async def llm_batch(policy, pkgs):
     if not (LLM_BASE and LLM_MODEL) or not pkgs:
         return {}
     user = json.dumps({"policyRevision": policy, "packages": pkgs}, ensure_ascii=False)
     body = {"model": LLM_MODEL, "temperature": 0, "messages": [
         {"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
-        "response_format": {"type": "json_object"}}
+        "response_format": {"type": "json_object"},
+            "max_tokens": int(os.environ.get("MAX_TOKENS", "8000"))}
+    if os.environ.get("LLM_REASONING"):
+        body["reasoning_effort"] = os.environ["LLM_REASONING"]
     hdr = {"Authorization": f"Bearer {LLM_KEY}"} if LLM_KEY else {}
-    async with httpx.AsyncClient(timeout=34) as c:
-        r = await c.post(f"{LLM_BASE}/chat/completions", json=body, headers=hdr)
-        if r.status_code == 400:
-            body.pop("response_format")
+    async with httpx.AsyncClient(timeout=40) as c:
+        for attempt in range(2):
             r = await c.post(f"{LLM_BASE}/chat/completions", json=body, headers=hdr)
+            if r.status_code == 400 and "response_format" in body:
+                body.pop("response_format")
+                continue
+            if r.status_code in (500, 502, 503) and attempt == 0:
+                await asyncio.sleep(2)
+                continue
+            break
         r.raise_for_status()
         txt = r.json()["choices"][0]["message"]["content"]
     txt = txt[txt.find("{"): txt.rfind("}") + 1]
@@ -288,11 +298,16 @@ async def decide(policy, pkgs):
         else:
             todo.append(p)
     if todo:
-        try:
-            got = await llm_batch(policy, todo)
-        except Exception as ex:
-            print("LLM ERROR:", repr(ex), getattr(getattr(ex, "response", None), "text", "")[:500], flush=True)
-            got = {}
+        size = int(os.environ.get("CHUNK", "4"))
+
+        async def one(ch):
+            try:
+                return await llm_batch(policy, ch)
+            except Exception as ex:
+                print("LLM ERROR:", repr(ex), getattr(getattr(ex, "response", None), "text", "")[:300], flush=True)
+                return {}
+        parts = await asyncio.gather(*(one(todo[i:i + size]) for i in range(0, len(todo), size)))
+        got = {k: v for p in parts for k, v in p.items()}
         for p in todo:
             d = validate(p, got.get(str(p["packageId"])))
             if d:
